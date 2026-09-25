@@ -1,122 +1,115 @@
-import os
-import threading
-import time
-from flask import Flask
+import os, time, threading, requests, re
+from flask import Flask, request, jsonify
 import telebot
+from collections import deque
 
-BOT_TOKEN = os.environ.get("BOT_TOKEN")
-if not BOT_TOKEN:
-    print("HATA PASAM: BOT_TOKEN YOK!")
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+BETANO_USER = os.getenv("BETANO_USER")
+BETANO_PASS = os.getenv("BETANO_PASS")
+CHAT_ID = None
 
-bot = telebot.TeleBot(BOT_TOKEN)
 app = Flask(__name__)
+bot = telebot.TeleBot(BOT_TOKEN) if BOT_TOKEN else None
 
-# ===== AYARLAR =====
-KASA_BASLANGIC = 1000.0
-kasa = KASA_BASLANGIC
-BAHISLER = [10, 30, 90] # Dogru martingale 1.50 icin, her kazanc +5 euro
-HEDEF = 1.50
+history = deque(maxlen=100)
+kasa = 1000.0
+bet_amount = 10
+martingale_step = 0
+signal_active = False
+martingale_bets = [10, 30, 90]
 
-son_veriler = [13.69, 7.84, 1.2, 1.1, 1.3, 1.4, 1.2]
-aktif = False
-adim = 0
-CHAT_IDS = set()
+last_crash = None
 
-def bildirim(mesaj):
-    for cid in list(CHAT_IDS):
+def send_telegram(msg):
+    if bot and CHAT_ID:
         try:
-            bot.send_message(cid, mesaj, parse_mode='HTML')
-        except:
-            pass
-
-def isle(yeni_oran):
-    global kasa, aktif, adim, son_veriler
-    son_veriler.append(yeni_oran)
-    if len(son_veriler) > 200:
-        son_veriler = son_veriler[-200:]
-
-    print(f"Oran geldi: {yeni_oran} Kasa: {kasa}")
-
-    # Martingale kontrol
-    if aktif:
-        bahis = BAHISLER[adim]
-        if yeni_oran >= HEDEF:
-            kasa += bahis * 1.5
-            msg = f"✅ <b>KAZANDI PASAM!</b>\n📈 Oran: {yeni_oran}x\n💵 Bahis: {bahis}€ -> {bahis*1.5}€\n💰 KASA: {round(kasa,2)}€\n📊 Adim: {adim+1}/3 - KAR +5€"
-            bildirim(msg)
-            aktif = False
-            adim = 0
-        else:
-            if adim == 2:
-                msg = f"❌ <b>KAYBETTI PASAM!</b>\n📉 Oran: {yeni_oran}x\n💸 Zarar: -{sum(BAHISLER)}€\n💰 KASA: {round(kasa,2)}€"
-                bildirim(msg)
-                aktif = False
-                adim = 0
-            else:
-                adim += 1
-                yeni_bahis = BAHISLER[adim]
-                kasa -= yeni_bahis
-                msg = f"⚠️ <b>{adim}. adim yatti</b> {yeni_oran}x\n➡️ {adim+1}. adim {yeni_bahis}€ basildi\n💰 Kasa: {round(kasa,2)}€"
-                bildirim(msg)
-        return
-
-    # Tetik kontrol - 5 kez < 2.0
-    if len(son_veriler) >= 5:
-        son5 = son_veriler[-5:]
-        if all(x < 2.0 for x in son5):
-            aktif = True
-            adim = 0
-            bahis = BAHISLER[0]
-            kasa -= bahis
-            msg = f"🚨 <b>SINYAL PASAM!</b> 🚨\n5 kez <2x geldi!\nSon 5: {son5}\n\n💰 {bahis}€ GIRIS\n🎯 Hedef: 1.50x\n💰 Kasa: {round(kasa,2)}€"
-            bildirim(msg)
-
-@app.route('/')
-def home():
-    s5 = son_veriler[-5:] if len(son_veriler)>=5 else son_veriler
-    return f"<h1>Sharo Bot 2.0 Calisiyor!</h1><p>Kasa: {round(kasa,2)}€ | Aktif: {aktif} Adim:{adim+1}</p><p>Son 5: {s5}</p><p>Son 20: {son_veriler[-20:]}</p>"
-
-@bot.message_handler(commands=['start'])
-def start(m):
-    CHAT_IDS.add(m.chat.id)
-    bot.reply_to(m, f"PASAM BOT AKTIF! 🔥\nKasa: {round(kasa,2)}€\n\n5x <2x -> 10/30/90 -> 1.50x\n\nKomutlar:\n/durum\n/kasa\n/test 1.2")
-
-@bot.message_handler(commands=['durum'])
-def durum(m):
-    bot.reply_to(m, f"Son 5: {son_veriler[-5:]}\nKasa: {round(kasa,2)}€\nAktif: {aktif} Adim: {adim+1}")
-
-@bot.message_handler(commands=['kasa'])
-def kasa_cmd(m):
-    bot.reply_to(m, f"KASA: {round(kasa,2)}€")
-
-@bot.message_handler(commands=['test'])
-def test_cmd(m):
-    try:
-        oran = float(m.text.split()[1].replace(',', '.'))
-        isle(oran)
-        bot.reply_to(m, f"Eklendi: {oran}x | Kasa: {round(kasa,2)}€")
-    except:
-        bot.reply_to(m, "Ornek: /test 1.2")
-
-def run_bot():
-    print("PASAM BOT BASLIYOR...")
-    while True:
-        try:
-            bot.infinity_polling(timeout=60, long_polling_timeout=60)
+            bot.send_message(CHAT_ID, msg, parse_mode='HTML')
         except Exception as e:
-            print(f"Bot hata: {e}")
+            print(f"Telegram hatası: {e}")
+
+def process_result(value):
+    global kasa, martingale_step, signal_active, last_crash
+    if last_crash == value:
+        return
+    last_crash = value
+    history.append(value)
+    print(f"Yeni oran: {value}x | Geçmiş: {list(history)[-10:]}")
+
+    # STRATEJİ: 5 pembe üst üste düşük (1.5 altı)
+    if len(history) >= 5:
+        last5 = list(history)[-5:]
+        if all(v < 1.5 for v in last5):
+            if not signal_active:
+                signal_active = True
+                martingale_step = 0
+                send_telegram(f"🚨 <b>SİNYAL PAŞAM!</b>\n5 düşük geldi: {last5}\n<b>BAHİS: {martingale_bets[0]}€ @ 1.5x</b>")
+                return
+
+    if signal_active:
+        if value >= 1.5:
+            kazanc = martingale_bets[martingale_step] * 1.5 - martingale_bets[martingale_step]
+            kasa += kazanc
+            send_telegram(f"✅ <b>KAZANDI PAŞAM!</b>\nBahis: {martingale_bets[martingale_step]}€ -> {martingale_bets[martingale_step]*1.5}€\nKASA: {kasa:.1f}€")
+            signal_active = False
+            martingale_step = 0
+        else:
+            kasa -= martingale_bets[martingale_step]
+            martingale_step += 1
+            if martingale_step < 3:
+                send_telegram(f"⚠️ <b>{martingale_step}. ADIM YATTI PAŞAM!</b>\n{value}x geldi\nYeni bahis: {martingale_bets[martingale_step]}€\nKASA: {kasa:.1f}€")
+            else:
+                send_telegram(f"❌ <b>KAYBETTİ PAŞAM -130€</b>\nKASA: {kasa:.1f}€")
+                signal_active = False
+                martingale_step = 0
+
+def betano_scraper():
+    print("Betano scraper başlıyor paşam...")
+    time.sleep(10) # Flask başlasın
+    try:
+        from playwright.sync_api import sync_playwright
+        with sync_playwright() as p:
+            browser = p.chromium.launch(headless=True, args=["--no-sandbox"])
+            page = browser.new_page()
+            print("Betano.bg'ye gidiliyor...")
+            page.goto("https://www.betano.bg/", timeout=60000)
             time.sleep(5)
 
-def fake_data():
-    import random
-    while True:
-        time.sleep(10)
-        r = random.uniform(1.05, 1.99) if random.random() < 0.75 else random.uniform(2.0, 15.0)
-        r = round(r, 2)
-        isle(r)
+            # Login dene
+            try:
+                if BETANO_USER and BETANO_PASS:
+                    page.click("text=Login", timeout=5000)
+                    time.sleep(2)
+                    page.fill("input[name='username'], input[type='email']", BETANO_USER)
+                    page.fill("input[name='password'], input[type='password']", BETANO_PASS)
+                    page.click("button:has-text('Login'), button:has-text('Вход')")
+                    time.sleep(8)
+                    print("Login denendi paşam")
+            except Exception as e:
+                print(f"Login atlandı: {e}")
 
-if __name__ == '__main__':
-    threading.Thread(target=run_bot, daemon=True).start()
-    threading.Thread(target=fake_data, daemon=True).start()
-    port = int(os.environ.get("PORT", 10000))
-    app.run(host='0.0.0.0', port=port)
+            # Aviator'a git
+            page.goto("https://www.betano.bg/casino/live-casino/games/aviator/200078/", timeout=60000)
+            time.sleep(15)
+            print("Aviator sayfasında paşam, veri bekleniyor...")
+
+            last_seen = None
+            while True:
+                try:
+                    # Spribe geçmişini JS ile almaya çalış
+                    content = page.content()
+                    # 1.23x gibi oranları regex ile bul
+                    matches = re.findall(r'(\d+\.\d{1,2})x', content)
+                    if matches:
+                        latest = matches[-1]
+                        try:
+                            val = float(latest)
+                            if val!= last_seen and 1.0 < val < 1000:
+                                last_seen = val
+                                process_result(val)
+                        except:
+                            pass
+
+                    # Alternatif: sayfadaki history elementleri
+                    try:
+                        elems = page.query_selector_all(".payout,.history-item, [class*='history']")
+                        for el
