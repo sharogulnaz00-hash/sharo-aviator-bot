@@ -1,40 +1,49 @@
+
+import os
+import threading
+import time
 from flask import Flask
-import threading, time, requests, os, random
-from collections import deque
+import telebot
 
+# Paşam token Render'dan geliyor
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+print(f"BOT_TOKEN var mi paşam? { 'EVET' if BOT_TOKEN else 'HAYIR - EKSIK!' }")
+
+bot = telebot.TeleBot(BOT_TOKEN)
 app = Flask(__name__)
-BOT_TOKEN = os.getenv("8655171423:AAGLolKEGGWAlsmdCBFj8bNxoya9bp9MpUo")
-CHAT_ID = os.getenv("6962368970")
-history = deque(maxlen=100)
 
-def send_telegram(text):
-    if not BOT_TOKEN or not CHAT_ID: return
-    try:
-        url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
-        requests.post(url, json={"chat_id": CHAT_ID, "text": text, "parse_mode": "Markdown"}, timeout=10)
-    except: pass
+# Senin Betano verilerin paşam - burası sende vardı
+son_veriler = [13.69, 7.84, 7.85, 14.32, 18.09, 19.93, 11.68, 8.7, 8.71, 10.33, 19.43, 15.59, 10.74, 5.87, 13.87, 3.06, 9.88, 17.0, 10.63, 6.72]
 
-def aviator_loop():
-    time.sleep(10)
-    send_telegram("🚀 *Sharo Bot Canli!* Betano takip basladi pasam!")
-    mavi = 0
-    while True:
-        crash = round(random.uniform(1.05, 20), 2)
-        if crash < 2.0: mavi += 1
-        else:
-            if mavi >= 4:
-                send_telegram(f"🔵 *MAVI ALARM!* {mavi} eldir 2x alti!\nSon: {list(history)[-5:]}\n*PEMBE BEKLENIYOR!* 🟣")
-            mavi = 0
-        if crash >= 10:
-            send_telegram(f"🟣 *PEMBE!* {crash}x geldi pasam!")
-        history.append(crash)
-        time.sleep(7)
-
-threading.Thread(target=aviator_loop, daemon=True).start()
-
-@app.route("/")
+@app.route('/')
 def home():
-    return f"<h1>Sharo Bot Calisiyor!</h1><p>Son: {list(history)[-20:]}</p>"
+    return f"<h1>Sharo Bot Calisiyor!</h1><br>Son: {son_veriler}<br><br>PAŞAM BOT AKTIF!"
 
-if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=10000)
+@bot.message_handler(commands=['start'])
+def start_cmd(message):
+    bot.reply_to(message, "PAŞAM BOT AKTİF! 🔥\n\nBetano izleniyor!\n\nKomutlar:\n/start - Botu baslat\n/durum - Son verileri gor")
+
+@bot.message_handler(commands=['durum'])
+def durum_cmd(message):
+    bot.reply_to(message, f"Son veriler paşam: {son_veriler}")
+
+@bot.message_handler(func=lambda m: True)
+def all_msg(message):
+    bot.reply_to(message, "Paşam /start yaz! Bot aktif!")
+
+def run_telegram():
+    print("PAŞAM TELEGRAM BOT BAŞLIYOR...")
+    while True:
+        try:
+            bot.infinity_polling(timeout=60, long_polling_timeout=60)
+        except Exception as e:
+            print(f"Paşam bot hatasi: {e}")
+            time.sleep(5)
+
+# WEBSITE + TELEGRAM AYNI ANDA CALISSIN PAŞAM
+if __name__ == '__main__':
+    # Telegram'i arka planda baslat paşam
+    threading.Thread(target=run_telegram, daemon=True).start()
+    # Website'yi baslat
+    port = int(os.environ.get("PORT", 10000))
+    app.run(host='0.0.0.0', port=port)
